@@ -6,3 +6,5 @@
 *.egg
 *.egg-info/
 *.whl
+vid.info.json
+/downloads/

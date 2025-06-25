@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 from pydantic import BaseModel
@@ -7,8 +7,12 @@ import yt_dlp
 import json
 import os
 import asyncio
+import re
+import uuid
 
 app = FastAPI()
+
+app.mount("/downloads", StaticFiles(directory="downloads"), name="downloads")
 
 origins = [
     "http://localhost:5173",
@@ -28,6 +32,9 @@ class FetchRequest(BaseModel):
 class DownloadRequest(BaseModel):
     video_id: str
     format_id: str
+    title: str = None
+    extension: str = None
+    unique_id: str = None
 
 # fetch info endpoint
 @app.post("/fetch")
@@ -38,19 +45,21 @@ def fetchInfo(request: FetchRequest):
     url = request.url
     format_values = list()
 
+    unique_id = str(uuid.uuid4())
+
     fetch_opts = {
         "quite": True,
         "skip_download": True,
         "writeinfojson": True,
         "overwrite": True,
-        "outtmpl" : "vid.%(ext)s",
+        "outtmpl" : f"{unique_id}.%(ext)s",
     }
 
     try:
         with yt_dlp.YoutubeDL(fetch_opts) as ydl:
             ydl.download([url])
             try:
-                with open(f"vid.info.json", "r", encoding="utf8") as info_file:
+                with open(f"{unique_id}.info.json", "r", encoding="utf8") as info_file:
                     video_info = json.load(info_file)
             except FileNotFoundError as error:
                 return {"error": str(error)}
@@ -58,18 +67,20 @@ def fetchInfo(request: FetchRequest):
             if 'formats' in video_info:
                 for fmt in video_info.get('formats'):
                     if fmt.get('height') and fmt.get('vcodec') != 'none' and fmt.get('ext') != 'mp4':
-                        format_values.append({"format_id": f"{fmt.get('format_id')}", "text": f"{fmt.get('height')}p | {fmt.get('fps', 'N/A')} fps | Resolution: {fmt.get('resolution', 'N/A')} | Extension: {fmt.get('ext', 'N/A')}"})
+                        format_values.append({"format_id": f"{fmt.get('format_id')}", "text": f"{fmt.get('format_note')} | {fmt.get('fps', 'N/A')} fps | Resolution: {fmt.get('resolution', 'N/A')}", "height": fmt.get('height')})
 
                 if len(format_values) == 0:
                     for fmt in video_info.get('formats'):
                         if fmt.get('height') and fmt.get('vcodec') != 'none':
-                            format_values.append({"format_id": f"{fmt.get('format_id')}", "text": f"{fmt.get('height')}p | {fmt.get('fps', 'N/A')} fps | Resolution: {fmt.get('resolution', 'N/A')} | Extension: {fmt.get('ext', 'N/A')}"})
+                            format_values.append({"format_id": f"{fmt.get('format_id')}", "text": f"{fmt.get('format_note')} | {fmt.get('fps', 'N/A')} fps | Resolution: {fmt.get('resolution', 'N/A')}", "height": fmt.get('height')})
                 # print(format_values)
                 return {
                     "id": video_info.get('id', ''),
                     "title": video_info.get('title', ''),
+                    "extension": video_info.get('ext'),
                     "thumbnail": video_info.get('thumbnail', ''),
-                    "formats": format_values
+                    "formats": format_values,
+                    "unique_id": unique_id,
                 }
             else:
                 return {"error": "No formats found in video info"}
@@ -81,16 +92,17 @@ def downloadVideo(request: DownloadRequest):
     if not request.video_id or not request.format_id:
         return {"error": "Video ID and format are required"}
 
-    # video_id = request.video_id
-    video_id = 'vid'
     format_id = request.format_id
+    unique_id = request.unique_id
+    title = sanitize_filename(request.title)
+    extension = sanitize_filename(request.extension)
+
     file_path = os.getcwd()
 
     ydl_opts = {
         "load_info_filename": True,
         'format': f'{format_id}+bestaudio/{format_id}+best[acodec!=none]/best',
-        'outtmpl': "%(id)s-%(height)s.%(ext)s",
-        'merge_output_format': 'mp4',
+        'outtmpl': f"{file_path}/downloads/{title}.{extension}",
         'progress_hooks': [download_progress_hook],
         'postprocessor_hooks': [download_postprocessor_hook],
         'quiet': True,
@@ -98,8 +110,12 @@ def downloadVideo(request: DownloadRequest):
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
-            ydl.download_with_info_file(f"{file_path}/{video_id}.info.json")
-            return {"status": "Download started", "message": "Download is in progress"}
+            ydl.download_with_info_file(f"{file_path}/{unique_id}.info.json")
+            return {
+                "status": "success",
+                "message": "Download completed",
+                "file_path": url_for('downloads', path=f"/downloads/{title}.{extension}")
+            }
         except Exception as error:
             return {"error": str(error)}
 
@@ -112,7 +128,7 @@ async def progress_stream(request: Request):
 
             yield {
                 "event": "progress",
-                "data": str(progress_data)
+                "data": json.dumps(progress_data)
             }
             await asyncio.sleep(1)
 
@@ -144,5 +160,12 @@ def download_progress_hook(p):
 
 def download_postprocessor_hook(p):
     if p['status'] == 'finished':
-        return {'status': 'finished', 'message': '*** Download Completed ***'}
+        progress_data["status"] = "finished"
+        progress_data["percent"] = 100.0
+        progress_data["message"] = "Download completed"
 #end hooks
+def sanitize_filename(filename):
+    filename = re.sub(r'[<>:"/\\|?*\s]', '_', filename)
+    filename = re.sub(r'_+', '_', filename)  # Replace multiple underscores with single
+    filename = filename.strip(' ._')
+    return filename
